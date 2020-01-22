@@ -18,10 +18,22 @@ class WebhookManager {
    * @param {Object}   params.t - AVA test object
    * @param {Boolean}  [params.isWebhookSimulated = true]
    *
-   * @param {Function} [params.createEvent] - required if isWebhookSimulated is true
-   * @param {Function} [params.listEvents] - required if isWebhookSimulated is true
+   * @param {Function} [params.mapToStelaceEvents(lastFetchTimestamp)] - required if isWebhookSimulated is true
+   *   poll events from external service and copy them into Stelace to simulate webhooks
+   * @example
+   *   async mapToStelaceEvents(lastFetchTimestamp) {
+   *     const events = await exampleSdk.events.list({ gt: lastFetchTimestamp })
    *
-   * @param {Function} [params.createWebhook] - can be provided if isWebhookSimulated is false
+   *     for (const event of events) {
+   *       await request(t.context.serverUrl)
+   *         .post(webhookUrl)
+   *         .send(event)
+   *         .set({ authorization: `Basic ${basicAuth}` })
+   *         .expect(200)
+   *     }
+   *   }
+   *
+   * @param {Function} [params.createWebhook(tunnelUrl)] - can be provided if isWebhookSimulated is false
    * @param {Function} [params.removeWebhook] - can be provided if isWebhookSimulated is false
    *
    * Please refer to ngrok options (https://github.com/bubenshchykov/ngrok#options)
@@ -30,7 +42,7 @@ class WebhookManager {
    * @param {String}   [params.tunnel.auth]
    * @param {String}   [params.tunnel.authToken]
    */
-  constructor ({ t, isWebhookSimulated = true, tunnel, createEvent, listEvents, createWebhook, removeWebhook }) {
+  constructor ({ t, isWebhookSimulated = true, tunnel, mapToStelaceEvents, createWebhook, removeWebhook }) {
     this.t = t
 
     // minus one second to handle cases events are generated during the same second of webhook manager creation
@@ -39,16 +51,15 @@ class WebhookManager {
     this.isWebhookSimulated = isWebhookSimulated
     this.tunnel = tunnel || {}
 
-    this.createEvent = createEvent
-    this.listEvents = listEvents
+    this.mapToStelaceEvents = mapToStelaceEvents
     this.createWebhook = createWebhook || noop
     this.removeWebhook = removeWebhook || noop
   }
 
   async start () {
     if (this.isWebhookSimulated) {
-      if (!this.createEvent || !this.listEvents) {
-        throw new Error('Functions `createEvent` and `listEvents` expected')
+      if (!this.mapToStelaceEvents) {
+        throw new Error('Functions `mapToStelaceEvents` expected')
       }
     }
 
@@ -80,13 +91,8 @@ class WebhookManager {
 
     if (!this.isWebhookSimulated) return
 
-    const events = await this.listEvents(this.lastEventTimestamp)
-
+    await this.mapToStelaceEvents(this.lastEventTimestamp)
     this.lastEventTimestamp = getTimestamp()
-
-    for (const event of events) {
-      await this.createEvent(event)
-    }
 
     // give enough time for Stelace events to be created
     await delay(waitDurationMs)
