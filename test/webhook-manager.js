@@ -3,7 +3,6 @@ const ngrok = require('ngrok')
 
 const { getAccessTokenHeaders } = require('./auth')
 
-const delay = duration => new Promise(resolve => setTimeout(resolve, duration))
 const noop = () => Promise.resolve()
 
 // Utility to test external service webhooks integration into Stelace
@@ -18,21 +17,39 @@ class WebhookManager {
    * @param {Object}   params.t - AVA test object
    * @param {Boolean}  [params.isWebhookSimulated = true]
    *
-   * @param {Function} [params.mapToStelaceEvents(lastFetchTimestamp)] - required if isWebhookSimulated is true
-   *   poll events from external service and copy them into Stelace to simulate webhooks
+   * @param {Function} [params.simulateWebhookSince(lastFetchTimestamp)] - required if isWebhookSimulated is true
+   *   poll events from external service and hit Stelace webhook endpoint
+   *   should return the last event timestamp for next fetch
    * @example
-   *   async mapToStelaceEvents(lastFetchTimestamp) {
+   *   const processedEventIds = {}
+   *
+   *   async simulateWebhookSince(lastFetchTimestamp) {
+   *     // we recommend to apply deduplication on events
+   *     // because events created within the same second can be not available at the same time
+   *     // via Events API
    *     const events = await exampleSdk.events.list({ gt: lastFetchTimestamp })
    *
+   *     // please apply deduplication on events as
+   *
    *     for (const event of events) {
+   *       if (processedEventIds[event.id]) continue
+   *
    *       await request(t.context.serverUrl)
    *         .post(webhookUrl)
    *         .send(event)
    *         .set({ authorization: `Basic ${basicAuth}` })
    *         .expect(200)
+   *
+   *       processedEventIds[event.id] = true
    *     }
+   *
+   *     const timestamps = events.map(e => e.created)
+   *     const maxTimestamp = _.max(timestamps) - 1 // to be sure to fetch processed events
+   *     return maxTimestamp ? maxTimestamp - 1 : null
    *   }
    *
+   * @param {Boolean}  [params.webhookFetchInterval = 2000] - specify the duration in milliseconds for events fetching
+   *   if isWebhookSimulated is true
    * @param {Function} [params.createWebhook(tunnelUrl)] - can be provided if isWebhookSimulated is false
    * @param {Function} [params.removeWebhook] - can be provided if isWebhookSimulated is false
    *
@@ -42,7 +59,15 @@ class WebhookManager {
    * @param {String}   [params.tunnel.auth]
    * @param {String}   [params.tunnel.authToken]
    */
-  constructor ({ t, isWebhookSimulated = true, tunnel, mapToStelaceEvents, createWebhook, removeWebhook }) {
+  constructor ({
+    t,
+    isWebhookSimulated = true,
+    simulateWebhookSince,
+    webhookFetchInterval = 2000,
+    createWebhook,
+    removeWebhook,
+    tunnel
+  }) {
     this.t = t
 
     // minus one second to handle cases events are generated during the same second of webhook manager creation
@@ -51,51 +76,52 @@ class WebhookManager {
     this.isWebhookSimulated = isWebhookSimulated
     this.tunnel = tunnel || {}
 
-    this.mapToStelaceEvents = mapToStelaceEvents
+    this.webhookFetchInterval = webhookFetchInterval
+    this.simulateWebhookSince = simulateWebhookSince
+    this.simulateWebhookInterval = null
+
     this.createWebhook = createWebhook || noop
     this.removeWebhook = removeWebhook || noop
   }
 
   async start () {
     if (this.isWebhookSimulated) {
-      if (!this.mapToStelaceEvents) {
-        throw new Error('Functions `mapToStelaceEvents` expected')
+      if (!this.simulateWebhookSince) {
+        throw new Error('Functions `simulateWebhookSince` expected')
       }
     }
 
-    if (this.isWebhookSimulated) return
+    if (this.isWebhookSimulated) {
+      this.simulateWebhookInterval = setInterval(async () => {
+        const timestamp = await this.simulateWebhookSince(this.lastEventTimestamp)
+        this.lastEventTimestamp = timestamp
+      }, this.webhookFetchInterval)
+    } else {
+      // https://github.com/bubenshchykov/ngrok#connect
+      this.tunnelUrl = await ngrok.connect({
+        addr: this.t.context.serverPort,
+        auth: this.tunnel.auth || undefined,
+        subdomain: this.tunnel.subdomain || undefined,
+        authtoken: this.tunnel.authToken || undefined
+      })
 
-    // https://github.com/bubenshchykov/ngrok#connect
-    this.tunnelUrl = await ngrok.connect({
-      addr: this.t.context.serverPort,
-      auth: this.tunnel.auth || undefined,
-      subdomain: this.tunnel.subdomain || undefined,
-      authtoken: this.tunnel.authToken || undefined
-    })
-
-    await this.createWebhook(this.tunnelUrl)
+      await this.createWebhook(this.tunnelUrl)
+    }
   }
 
   async stop () {
-    if (this.isWebhookSimulated) return
-
-    // https://github.com/bubenshchykov/ngrok#disconnect
-    await ngrok.disconnect(this.tunnelUrl)
+    if (this.isWebhookSimulated) {
+      clearInterval(this.simulateWebhookInterval)
+    } else {
+      // https://github.com/bubenshchykov/ngrok#disconnect
+      await ngrok.disconnect(this.tunnelUrl)
+    }
   }
 
   // if isWebhookSimulated is false, really wait webhooks events
   // otherwise, fetch events not retrieved from last time to simulate a real webhook running
   async waitForEvents (waitDurationMs = 10000) {
-    // give enough time for external service events to be created
-    await delay(waitDurationMs)
-
-    if (!this.isWebhookSimulated) return
-
-    await this.mapToStelaceEvents(this.lastEventTimestamp)
-    this.lastEventTimestamp = getTimestamp()
-
-    // give enough time for Stelace events to be created
-    await delay(waitDurationMs)
+    return new Promise(resolve => setTimeout(resolve, waitDurationMs))
   }
 
   // expose this function as convenience
